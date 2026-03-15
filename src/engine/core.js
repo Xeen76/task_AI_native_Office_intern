@@ -274,13 +274,17 @@ function parseTokensToAST(tokens) {
             }
             position++
         } else if (token.type === 'range') {
-            if (outputQueue.length < 2) throw new Error('Invalid range syntax')
-            const endCell = outputQueue.pop()
+            if (outputQueue.length < 1) throw new Error('Invalid range syntax')
             const startCell = outputQueue.pop()
-            if (startCell.type !== 'cell' || endCell.type !== 'cell') {
+            position++
+            const nextToken = tokens[position]
+            if (!nextToken || nextToken.type !== 'cell') {
                 throw new Error('Range must be between two cell references')
             }
-            outputQueue.push({ type: 'range', start: startCell.value, end: endCell.value })
+            if (startCell.type !== 'cell') {
+                throw new Error('Range must be between two cell references')
+            }
+            outputQueue.push({ type: 'range', start: startCell.value, end: nextToken.value })
             position++
         } else {
             position++
