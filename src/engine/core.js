@@ -829,16 +829,24 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         const entry = undoStack.pop()
 
         if (entry.type === 'set') {
-            // For cell edits, swap current value to redo stack and restore old value
             const currentValue = getCellRaw(entry.r, entry.c).raw
             redoStack.push({ ...entry, newVal: currentValue })
             setCellRaw(entry.r, entry.c, entry.oldVal)
             _generation++
             recalculate()
+        } else if (entry.type === 'batch') {
+            // Undo all changes in reverse order, record current values for redo
+            const currentVals = entry.changes.map(ch => ({
+                ...ch, newVal: getCellRaw(ch.r, ch.c).raw
+            }))
+            redoStack.push({ type: 'batch', changes: currentVals })
+            for (let i = entry.changes.length - 1; i >= 0; i--) {
+                const ch = entry.changes[i]
+                setCellRaw(ch.r, ch.c, ch.oldVal)
+            }
+            _generation++
+            recalculate()
         } else {
-            // For structural changes (row/col insert/delete), save current state to redo
-            // and restore the snapshot from undo entry
-            // Note: The snapshot contains the cell data, but rows/cols must be restored separately
             redoStack.push({
                 ...entry,
                 restoreSnap: takeSnapshot(),
@@ -846,8 +854,6 @@ export function createEngine(initialRows = 50, initialCols = 50) {
                 restoreCols: cols
             })
             restoreSnapshot(entry.snap)
-            // Restore grid dimensions - this must happen after restoreSnapshot
-            // because restoreSnapshot increments _generation but doesn't modify rows/cols
             if (entry.type === 'rowins' || entry.type === 'rowdel') rows = entry.oldRows
             else if (entry.type === 'colins' || entry.type === 'coldel') cols = entry.oldCols
             recalculate()
@@ -863,6 +869,16 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             const currentValue = getCellRaw(entry.r, entry.c).raw
             undoStack.push({ ...entry, oldVal: currentValue })
             setCellRaw(entry.r, entry.c, entry.newVal)
+            _generation++
+            recalculate()
+        } else if (entry.type === 'batch') {
+            const currentVals = entry.changes.map(ch => ({
+                ...ch, oldVal: getCellRaw(ch.r, ch.c).raw
+            }))
+            undoStack.push({ type: 'batch', changes: currentVals })
+            for (const ch of entry.changes) {
+                setCellRaw(ch.r, ch.c, ch.newVal)
+            }
             _generation++
             recalculate()
         } else {
@@ -898,16 +914,204 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         return { raw: cell.raw, computed: value, error: null }
     }
 
+    // ── Batch paste (single undo entry for multi-cell paste) ──
+
+    function executeBatchSet(cellUpdates) {
+        // cellUpdates: Array of { row, col, value }
+        // Creates a single undo entry for all changes
+        const oldValues = cellUpdates.map(({ row, col }) => ({
+            row, col, value: getCellRaw(row, col).raw
+        }))
+        // Filter to only cells that actually change
+        const changes = cellUpdates.filter(({ row, col, value }, i) => oldValues[i].value !== value)
+        if (changes.length === 0) return
+        const oldVals = changes.map(({ row, col }) => ({
+            row, col, value: getCellRaw(row, col).raw
+        }))
+        pushToUndoStack({ type: 'batch', changes: changes.map((c, i) => ({
+            r: c.row, c: c.col, oldVal: oldVals[i].value, newVal: c.value
+        }))})
+        for (const { row, col, value } of changes) {
+            setCellRaw(row, col, value)
+            _generation++
+        }
+        recalculate()
+    }
+
+    // ── Sort & Filter (view-layer only) ──
+
+    // Sort state: { col: number, direction: 'asc' | 'desc' } or null
+    let sortState = null
+    // Filter state: Map<colIndex, Set<displayValue>> — only rows matching ALL filters are shown
+    let filterState = new Map()
+
+    function setSortState(col, direction) {
+        if (direction === null || direction === 'none') {
+            sortState = null
+        } else {
+            sortState = { col, direction }
+        }
+    }
+
+    function getSortState() {
+        return sortState ? { ...sortState } : null
+    }
+
+    function setColumnFilter(col, allowedValues) {
+        // allowedValues: Set of display-value strings, or null to clear
+        if (!allowedValues || allowedValues.size === 0) {
+            filterState.delete(col)
+        } else {
+            filterState.set(col, new Set(allowedValues))
+        }
+    }
+
+    function clearColumnFilter(col) {
+        filterState.delete(col)
+    }
+
+    function clearAllFilters() {
+        filterState.clear()
+    }
+
+    function getFilterState() {
+        const result = {}
+        for (const [col, vals] of filterState.entries()) {
+            result[col] = [...vals]
+        }
+        return result
+    }
+
+    function getColumnUniqueValues(col) {
+        // Returns sorted array of unique display values in a column
+        const values = new Set()
+        for (let r = 0; r < rows; r++) {
+            const cellData = getCellForDisplay(r, col)
+            const display = cellData.error
+                ? cellData.error
+                : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
+            values.add(display)
+        }
+        return [...values].sort()
+    }
+
+    function getDisplayValue(row, col) {
+        const cellData = getCellForDisplay(row, col)
+        return cellData.error
+            ? cellData.error
+            : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
+    }
+
+    function getViewRowOrder() {
+        // Returns an array of actual row indices in display order
+        // Applies filters first, then sorts the remaining rows
+        let rowIndices = []
+        for (let r = 0; r < rows; r++) rowIndices.push(r)
+
+        // Apply filters: keep only rows where every filtered column matches
+        if (filterState.size > 0) {
+            rowIndices = rowIndices.filter(r => {
+                for (const [col, allowedValues] of filterState.entries()) {
+                    const display = getDisplayValue(r, col)
+                    if (!allowedValues.has(display)) return false
+                }
+                return true
+            })
+        }
+
+        // Apply sort
+        if (sortState) {
+            const col = sortState.col
+            const dir = sortState.direction === 'asc' ? 1 : -1
+            rowIndices.sort((a, b) => {
+                const aVal = getDisplayValue(a, col)
+                const bVal = getDisplayValue(b, col)
+                // Try numeric comparison first
+                const aNum = parseFloat(aVal)
+                const bNum = parseFloat(bVal)
+                if (!isNaN(aNum) && !isNaN(bNum)) return (aNum - bNum) * dir
+                // Empty cells sort to the end
+                if (aVal === '' && bVal !== '') return 1
+                if (aVal !== '' && bVal === '') return -1
+                // String comparison
+                return aVal.localeCompare(bVal) * dir
+            })
+        }
+
+        return rowIndices
+    }
+
+    // ── Serialization ──
+
+    function serialize() {
+        // Returns a JSON-serializable representation of all cell data and grid dimensions
+        const cellData = {}
+        for (const [key, value] of cells.entries()) {
+            cellData[key] = { raw: value.raw }
+        }
+        return {
+            version: 1,
+            rows,
+            cols,
+            cells: cellData,
+        }
+    }
+
+    function deserialize(data) {
+        if (!data || typeof data !== 'object') return false
+        if (data.version !== 1) return false
+        try {
+            cells.clear()
+            graph.clear()
+            computedCache.clear()
+            dirtyCells.clear()
+            undoStack.length = 0
+            redoStack.length = 0
+            sortState = null
+            filterState.clear()
+            _generation++
+
+            rows = typeof data.rows === 'number' && data.rows > 0 ? data.rows : initialRows
+            cols = typeof data.cols === 'number' && data.cols > 0 ? data.cols : initialCols
+
+            if (data.cells && typeof data.cells === 'object') {
+                for (const [key, value] of Object.entries(data.cells)) {
+                    if (value && typeof value.raw === 'string' && value.raw.trim() !== '') {
+                        cells.set(key, { raw: value.raw, computed: null, error: null })
+                    }
+                }
+            }
+
+            // Rebuild dependency graph
+            for (const [key, value] of cells.entries()) {
+                if (value.raw && value.raw.startsWith('=')) {
+                    updateDependencies(key, value.raw)
+                }
+            }
+            markAllCellsDirty()
+            recalculate()
+            return true
+        } catch {
+            // If deserialization fails, reset to clean state
+            cells.clear()
+            graph.clear()
+            computedCache.clear()
+            dirtyCells.clear()
+            rows = initialRows
+            cols = initialCols
+            _generation++
+            return false
+        }
+    }
+
     // ── Public API ──
-    // The engine exposes a limited API to prevent direct access to internal state
-    // All cell operations go through the public methods which handle undo/redo,
-    // dependency tracking, and cache invalidation automatically
 
     return {
         get rows() { return rows },
         get cols() { return cols },
         getCell: getCellForDisplay,
         setCell: executeSetCell,
+        batchSetCells: executeBatchSet,
         insertRow: executeInsertRow,
         deleteRow: executeDeleteRow,
         insertColumn: executeInsertColumn,
@@ -916,7 +1120,17 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         redo,
         canUndo: () => undoStack.length > 0,
         canRedo: () => redoStack.length > 0,
-        // Internal state is not exposed - if you need to serialize/deserialize,
-        // you'll need to work with the public API or add new methods
+        // Sort & filter (view-layer)
+        setSortState,
+        getSortState,
+        setColumnFilter,
+        clearColumnFilter,
+        clearAllFilters,
+        getFilterState,
+        getColumnUniqueValues,
+        getViewRowOrder,
+        // Serialization
+        serialize,
+        deserialize,
     }
 }
